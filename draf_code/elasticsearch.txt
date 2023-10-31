@@ -1,0 +1,15 @@
+1. đầu tiên khởi động elasticsearch 
+
+2. tạo 1 index mới tên my_index nếu chưa có bằng cách chạy lệnh sau:
+
+curl -X PUT "http://localhost:9200/my_index"
+
+3. đâu tiền chạy api http://127.0.0.1:5000/converttojson
+
+ Api trên sử dụng khi user thêm 1 file vào chương trình thì chương trình 
+sẽ chuyển đổi sang file .txt để trích xuất các trường và nhập dữ liệu vào elasticsearch
+
+
+4. Sau khi đã thêm dữ liệu vào elasticsearch thì có thể dùng api bên dưới để search
+
+http://127.0.0.1:5000/search?q=Maternity
