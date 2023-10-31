@@ -100,6 +100,7 @@ def add_bulk_index_action(index, id, title, content, category):
 #     with open(os.path.join(app.config['JSON_FOLDER'], filename), 'w', encoding='utf-8') as json_file:
 #         json.dump(json_data, json_file, ensure_ascii=False, indent=4)
 
+
 @app.route('/converttojson', methods=['POST'])
 def convert_to_json():
     if not os.path.exists(app.config['JSON_FOLDER']):
@@ -226,6 +227,49 @@ def search():
     response = sorted(response, key=lambda x: x['score'], reverse=True)
 
     return jsonify(response)
+
+@app.route('/deletejson', methods=['POST'])
+def delete_json():
+    # Kiểm tra xem 'filename' đã được gửi từ người dùng hay không
+    if 'filename' not in request.form:
+        return jsonify({"error": "Missing 'filename' parameter"})
+
+    filename = request.form['filename']
+    index = "my_index"  # Thay bằng tên index của bạn
+
+    # Hàm để lấy _id dựa trên filename
+    def get_document_id_by_filename(index, filename):
+        query = {
+            "query": {
+                "match": {
+                    "filename": filename
+                }
+            }
+        }
+        result = es.search(index=index, body=query)
+        
+        if result["hits"]["total"]["value"] == 0:
+            return None
+        else:
+            return result["hits"]["hits"][0]["_id"]
+
+    # Hàm để xoá tài liệu dựa trên filename
+    def delete_document_by_filename(index, filename):
+        document_id = get_document_id_by_filename(index, filename)
+        if document_id:
+            es.delete(index=index, id=document_id)
+            return True
+        else:
+            return False
+
+    # Gọi hàm để xoá tài liệu
+    result = delete_document_by_filename(index, filename)
+    if result:
+        return jsonify({"message": "Dữ liệu đã được xoá thành công."})
+    else:
+        return jsonify({"error": "Không tìm thấy dữ liệu cần xoá."})
+
+
 
 if __name__ == '__main__':
     app.run()

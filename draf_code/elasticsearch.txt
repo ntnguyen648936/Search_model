@@ -13,3 +13,11 @@ sẽ chuyển đổi sang file .txt để trích xuất các trường và nhậ
 4. Sau khi đã thêm dữ liệu vào elasticsearch thì có thể dùng api bên dưới để search
 
 http://127.0.0.1:5000/search?q=Maternity
+
+
+
+5. dùng API sau để xoá 1 file tuỳ chọn
+
+http://127.0.0.1:5000/deletejson
+
+*chọn body -> form-data -> key : "filename" (chọn Text) -> value "002.txt" 
