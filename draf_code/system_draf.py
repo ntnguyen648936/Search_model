@@ -3,15 +3,17 @@
 # sau khi nhận được input chương trình sẽ trích xuất các trường và trả về file 
 
 # ngày 31/10 - chương trình cần cập thêm cách xử lí lấy các trường còn thiếu
-
+import json
+import re
+import os
+import torch
+from transformers import BertTokenizer, BertModel
 from elasticsearch import Elasticsearch
 from flask import Flask, request, jsonify
-import os
 from PyPDF2 import PdfFileReader
 from docx import Document
 from werkzeug.utils import secure_filename
-import json
-import re
+from nltk.tokenize import sent_tokenize
 
 app = Flask(__name__)
 
@@ -23,6 +25,11 @@ app.config['UPLOAD_FOLDER'] = "uploads"
 app.config['JSON_FOLDER'] = "json_output"
 
 es = Elasticsearch([{'host': '127.0.0.1', 'port': 9200, 'scheme': 'http'}])
+
+
+# Load pre-trained BERT model and tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+model = BertModel.from_pretrained('bert-base-uncased')
 
 
 # Tạo thư mục đầu ra cho JSON nếu nó chưa tồn tại
@@ -44,6 +51,14 @@ def convert_txt_to_json(file_path, filename):
             title = ""
             content = file_content
 
+
+         #BERT
+        input_ids = tokenizer.encode(content, add_special_tokens=True)
+        with torch.no_grad():
+            outputs = model(torch.tensor(input_ids).unsqueeze(0))
+            semantic_representation = outputs.last_hidden_state.mean(dim=1).tolist()[0]
+   
+
         id = str(id_counter).zfill(3)
         id_counter += 1
 
@@ -53,9 +68,9 @@ def convert_txt_to_json(file_path, filename):
             "filename": filename,
             "title": title,
             "content": content,
+            "semantic": semantic_representation,
             "category": category
         }
-        #json_output_path = os.path.join(app.config['JSON_FOLDER'], id + ".json")
         json_output_path = os.path.join(app.config['JSON_FOLDER'], os.path.splitext(filename)[0] + ".json")
 
         with open(json_output_path, "w", encoding="utf-8") as json_file:
@@ -96,10 +111,64 @@ def add_bulk_index_action(index, id, title, content, category):
     bulk_actions.append(json.dumps(action))
     bulk_actions.append(json.dumps(source))
 
-# def save_json_file(json_data, filename):
-#     with open(os.path.join(app.config['JSON_FOLDER'], filename), 'w', encoding='utf-8') as json_file:
-#         json.dump(json_data, json_file, ensure_ascii=False, indent=4)
 
+def search_by_semantic(user_input):
+
+    semantic_results = []
+
+    input_ids = tokenizer.encode(user_input, add_special_tokens=True)
+    with torch.no_grad():
+        user_input_embedding = model(torch.tensor(input_ids).unsqueeze(0))
+        user_input_embedding = user_input_embedding.last_hidden_state.mean(dim=1).tolist()[0]
+
+    search_body = {
+        "query": {
+            "match_all": {}
+        }
+    }
+
+    search_results = es.search(index="my_index", body=search_body, size=1000)  # Số lượng tệp JSON bạn muốn tìm kiếm
+    for hit in search_results['hits']['hits']:
+        filename = hit['_source']['filename']
+        semantic_representation = hit['_source']['semantic']
+
+        # Tính toán điểm số semantic sử dụng khoảng cách cosine giữa biểu diễn semantic của truy vấn và biểu diễn semantic của tệp
+        semantic_score = cosine_similarity(user_input_embedding, semantic_representation)
+        
+        related_sentences = extract_related_sentences(hit['_source']['content'], user_input)
+
+        entry = {
+            'title': hit['_source']['title'],
+            'filename': filename,
+            'related_sentences': related_sentences,
+            'semantic_score': semantic_score
+        }
+        semantic_results.append(entry)
+
+    # Sắp xếp kết quả theo điểm số semantic giảm dần
+    semantic_results = sorted(semantic_results, key=lambda x: x['semantic_score'], reverse=True)
+
+    return semantic_results
+
+def extract_related_sentences(content, user_input, num_sentences=3):
+
+    sentences = sent_tokenize(content)
+    related_sentences = []
+    for sentence in sentences:
+        if user_input in sentence:
+            related_sentences.append(sentence)
+        if len(related_sentences) >= num_sentences:
+            break
+    return related_sentences
+
+def cosine_similarity(embedding1, embedding2):
+    # Tính toán độ tương đồng cosine giữa hai biểu diễn semantic
+    dot_product = sum(a * b for a, b in zip(embedding1, embedding2))
+    magnitude1 = sum(a ** 2 for a in embedding1) ** 0.5
+    magnitude2 = sum(b ** 2 for b in embedding2) ** 0.5
+    if magnitude1 == 0 or magnitude2 == 0:
+        return 0  # Tránh chia cho 0
+    return dot_product / (magnitude1 * magnitude2)
 
 @app.route('/converttojson', methods=['POST'])
 def convert_to_json():
@@ -162,15 +231,6 @@ def convert_to_json():
             # Gửi dữ liệu JSON lên Elasticsearch
             es.index(index="my_index" ,body=json_data)
         #os.remove(temp_file_path)        
-
-    #print(jsonify({"message": "Conversion to JSON completed. JSON files saved in the JSON output directory."}))
-
-    # if uploaded_json_file:
-    #     json_data = json.load(json_output)
-
-    #     # Gửi dữ liệu JSON lên Elasticsearch
-    #     es.index(index="my_index", body=json_data)
-
         return jsonify({"message": "Conversion to JSON and upload to Elasticsearch completed."})
 
 
@@ -219,14 +279,22 @@ def search():
             'title': hit['_source']['title'],
             'filename': hit['_source']['filename'],
             'highlights': hit.get('highlight', {}).get('content', []),
-            'score': hit['_score']
+            'semantic_score': hit['_score']
         }
         response.append(entry)
 
-    # Sắp xếp kết quả theo mức độ đúng (score) giảm dần
-    response = sorted(response, key=lambda x: x['score'], reverse=True)
+    # Sắp xếp kết quả theo điểm số semantic giảm dần
+    response = sorted(response, key=lambda x: x['semantic_score'], reverse=True)
+
+    # Nếu không có trùng khớp dựa trên truy vấn ngữ nghĩa, sử dụng tìm kiếm ngữ nghĩa
+    if not response:
+        # Thực hiện tìm kiếm dựa trên biểu diễn semantic
+        semantic_results = search_by_semantic(user_input)
+        response = semantic_results
 
     return jsonify(response)
+
+
 
 @app.route('/deletejson', methods=['POST'])
 def delete_json():
