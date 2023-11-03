@@ -24,6 +24,8 @@ app.config['UPLOAD_FOLDER'] = "uploads"
 
 app.config['JSON_FOLDER'] = "json_output"
 
+data_directory = "/Users/nguyen/Desktop/Docker/system/draf_code/json_output"
+
 es = Elasticsearch([{'host': '127.0.0.1', 'port': 9200, 'scheme': 'http'}])
 
 
@@ -39,6 +41,8 @@ if not os.path.exists(app.config['JSON_FOLDER']):
 id_counter = 1
 bulk_actions = []
 
+
+
 def convert_txt_to_json(file_path, filename):
     global id_counter
     with open(file_path, 'r', encoding='utf-8') as file:
@@ -52,7 +56,7 @@ def convert_txt_to_json(file_path, filename):
             content = file_content
 
 
-         #BERT
+############# BERT model  ##############################
         input_ids = tokenizer.encode(content, add_special_tokens=True)
         with torch.no_grad():
             outputs = model(torch.tensor(input_ids).unsqueeze(0))
@@ -170,6 +174,18 @@ def cosine_similarity(embedding1, embedding2):
         return 0  # Tránh chia cho 0
     return dot_product / (magnitude1 * magnitude2)
 
+
+# suggestion search
+def add_suggestion_to_index(suggestion):
+    doc = {"suggestion": suggestion}
+    es.index(index="suggestions", body=doc)
+
+def extract_keywords_from_text(text):
+    words = re.findall(r'\b\w+\b', text)
+    return words
+
+
+
 @app.route('/converttojson', methods=['POST'])
 def convert_to_json():
     if not os.path.exists(app.config['JSON_FOLDER']):
@@ -219,9 +235,7 @@ def convert_to_json():
         else:
             return jsonify({"error": "Unsupported file format"})
 
-        # Lưu dữ liệu JSON vào tệp trong thư mục json_output
-        # json_filename = os.path.splitext(filename)[0] + ".json"
-        # save_json_file(json_data, json_filename)
+    
 
         # Xóa tệp tạm thời sau khi đã chuyển đổi
         json_output_path = os.path.join(app.config['JSON_FOLDER'], os.path.splitext(filename)[0] + ".json")
@@ -230,10 +244,22 @@ def convert_to_json():
 
             # Gửi dữ liệu JSON lên Elasticsearch
             es.index(index="my_index" ,body=json_data)
-        #os.remove(temp_file_path)        
+        #os.remove(temp_file_path)    
+
+
+        # Trích xuất từ khóa từ nội dung và thêm vào index gợi ý
+        for filename in os.listdir(data_directory):
+            if filename.endswith(".json"):
+                with open(os.path.join(data_directory, filename), 'r', encoding='utf-8') as json_file:
+                    data = json.load(json_file)
+                    content = data.get('content', '')
+                    keywords = extract_keywords_from_text(content)
+                    unique_keywords = list(set(keywords))
+                    for keyword in unique_keywords:
+                        add_suggestion_to_index(keyword)
+                        print(f"Added suggestion: {keyword}")
+
         return jsonify({"message": "Conversion to JSON and upload to Elasticsearch completed."})
-
-
 
 
 
@@ -336,6 +362,26 @@ def delete_json():
         return jsonify({"message": "Dữ liệu đã được xoá thành công."})
     else:
         return jsonify({"error": "Không tìm thấy dữ liệu cần xoá."})
+
+
+@app.route('/suggest', methods=['GET'])
+def get_suggestions():
+    user_query = request.args.get('q')
+    search_body = {
+        "suggest": {
+            "text-suggest": {
+                "prefix": user_query,
+                "completion": {
+                    "field": "suggestion",
+                    "size": 10
+                }
+            }
+        }
+    }
+    results = es.search(index="suggestions", body=search_body)
+    suggestions = results["suggest"]["text-suggest"][0]["options"]
+    return jsonify([suggestion["_source"]["suggestion"] for suggestion in suggestions])
+
 
 
 
