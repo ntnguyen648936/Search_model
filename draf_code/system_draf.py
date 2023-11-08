@@ -2,14 +2,18 @@
 # chương trình sẽ nhận input là 1 file txt bất kì từ user
 # sau khi nhận được input chương trình sẽ trích xuất các trường và trả về file 
 
-# ngày 31/10 - chương trình cần cập thêm cách xử lí lấy các trường còn thiếu
+
+import hashlib
 import json
 import re
 import os
 import torch
+import pytesseract
+import uuid
+from PIL import Image
 from transformers import BertTokenizer, BertModel
 from elasticsearch import Elasticsearch
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from PyPDF2 import PdfFileReader
 from docx import Document
 from werkzeug.utils import secure_filename
@@ -19,20 +23,15 @@ app = Flask(__name__)
 
 # Thư mục chứa tệp đầu vào
 input_directory = "uploads"
-
 app.config['UPLOAD_FOLDER'] = "uploads"
-
+app.config['EXTRACTED_TEXT_FOLDER'] = "extracted_text"
 app.config['JSON_FOLDER'] = "json_output"
-
 data_directory = "/Users/nguyen/Desktop/Docker/system/draf_code/json_output"
-
 es = Elasticsearch([{'host': '127.0.0.1', 'port': 9200, 'scheme': 'http'}])
-
 
 # Load pre-trained BERT model and tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertModel.from_pretrained('bert-base-uncased')
-
 
 # Tạo thư mục đầu ra cho JSON nếu nó chưa tồn tại
 if not os.path.exists(app.config['JSON_FOLDER']):
@@ -41,31 +40,33 @@ if not os.path.exists(app.config['JSON_FOLDER']):
 id_counter = 1
 bulk_actions = []
 
-
-
-def convert_txt_to_json(file_path, filename):
+def convert_txt_to_json(file_path, filename, image):
     global id_counter
     with open(file_path, 'r', encoding='utf-8') as file:
         file_content = file.read()
         match = re.search(r'.+?(?=\n\n)', file_content, re.DOTALL)
-        if match:
+        if match and image == False:
             title = match.group(0).strip()
             content = file_content[match.end():].strip()
         else:
-            title = ""
+            title = "image"
             content = file_content
 
+        content_hash = calculate_content_hash(content)
 
+        if is_document_exists("my_index", content_hash):
+            print(f"Document with content hash {content_hash} already exists. Skipping.")
+            return
+            
 ############# BERT model  ##############################
+# dùng BERT model để tính toán giá trị của semantic từ đó scó thể tìm kiếm dựa trên nội dung
         input_ids = tokenizer.encode(content, add_special_tokens=True)
         with torch.no_grad():
             outputs = model(torch.tensor(input_ids).unsqueeze(0))
             semantic_representation = outputs.last_hidden_state.mean(dim=1).tolist()[0]
    
-
         id = str(id_counter).zfill(3)
         id_counter += 1
-
         category = "business"
 
         json_data = {
@@ -73,23 +74,24 @@ def convert_txt_to_json(file_path, filename):
             "title": title,
             "content": content,
             "semantic": semantic_representation,
-            "category": category
+            "category": category,
+            "content_hash": content_hash
         }
+        
         json_output_path = os.path.join(app.config['JSON_FOLDER'], os.path.splitext(filename)[0] + ".json")
 
         with open(json_output_path, "w", encoding="utf-8") as json_file:
             json.dump(json_data, json_file, ensure_ascii=False)
 
-        # Thêm hành động index cho mỗi tệp JSON vào danh sách bulk actions
         add_bulk_index_action("my_index", id, title, content, category)
 
+# chuyển đổi từ các định dạng văn bản khác sang txt 
 def convert_docx_to_txt(file_path):
     doc = Document(file_path)
     text = ""
     for paragraph in doc.paragraphs:
         text += paragraph.text + "\n"
     return text
-
 
 def convert_pdf_to_text(file_path):
     doc = fitz.open(file_path)
@@ -106,6 +108,7 @@ def add_bulk_index_action(index, id, title, content, category):
             "_id": id
         }
     }
+
     source = {
         "filename": id + ".json",
         "title": title,
@@ -115,7 +118,7 @@ def add_bulk_index_action(index, id, title, content, category):
     bulk_actions.append(json.dumps(action))
     bulk_actions.append(json.dumps(source))
 
-
+# các hàm dùng để ứng dụng trong việc tìm kiếm dựa trên nội dung
 def search_by_semantic(user_input):
 
     semantic_results = []
@@ -130,7 +133,6 @@ def search_by_semantic(user_input):
             "match_all": {}
         }
     }
-
     search_results = es.search(index="my_index", body=search_body, size=1000)  # Số lượng tệp JSON bạn muốn tìm kiếm
     for hit in search_results['hits']['hits']:
         filename = hit['_source']['filename']
@@ -145,7 +147,9 @@ def search_by_semantic(user_input):
             'title': hit['_source']['title'],
             'filename': filename,
             'related_sentences': related_sentences,
-            'semantic_score': semantic_score
+            'semantic_score': semantic_score,
+            'content_hash': hit['_source']['content_hash']
+
         }
         semantic_results.append(entry)
 
@@ -174,7 +178,6 @@ def cosine_similarity(embedding1, embedding2):
         return 0  # Tránh chia cho 0
     return dot_product / (magnitude1 * magnitude2)
 
-
 # suggestion search
 def add_suggestion_to_index(suggestion):
     doc = {"suggestion": suggestion}
@@ -184,22 +187,86 @@ def extract_keywords_from_text(text):
     words = re.findall(r'\b\w+\b', text)
     return words
 
+#####kiểm tra xem file mà user upload đã tồn tại chưa######
 
+# calculate_content_hash tính giá trị hash của phân content
+def calculate_content_hash(content):
+    content_hash = hashlib.md5(content.encode()).hexdigest()
+    return content_hash
+
+def is_document_exists(index, content_hash):
+    query = {
+        "query": {
+            "term": {
+                "content_hash": content_hash
+            }
+        }
+    }
+    result = es.search(index=index, body=query)
+    return result["hits"]["total"]["value"] > 0
+
+def add_document_to_elasticsearch(index, filename, content):
+    content_hash = calculate_content_hash(content)
+
+    if is_document_exists(index, content_hash):
+        print("Tệp đã tồn tại và không cần cập nhật")
+        pass
+    else:
+        es.index(index=index, body={
+            "filename": filename,
+            "content_hash": content_hash
+        })
+
+
+def search_images(query):
+    # Thực hiện truy vấn Elasticsearch để tìm kiếm hình ảnh dựa trên nội dung
+    search_body = {
+        "query": {
+            "match": {
+                "content": query
+            }
+        }
+    }
+    results = es.search(index="my_index", body=search_body)
+
+    # Trả về danh sách các hình ảnh tương ứng
+    image_paths = []
+    for hit in results['hits']['hits']:
+        filename = os.path.splitext(hit['_id'])[0] + ".jpg"
+        image_paths.append(filename)
+
+    # Chuyển danh sách tên tệp hình ảnh thành kết quả tìm kiếm
+    image_results = []
+    for image_path in image_paths:
+        image_entry = {
+            'title': 'Image',
+            'filename': image_path,
+            'highlights':  hit.get('highlight', {}).get('content', []),
+            'semantic_score': hit['_score'],
+            'category': 'image',
+            'content_hash': ''
+        }
+        image_results.append(image_entry)
+
+    return image_results
+
+
+######## API #########
 
 @app.route('/converttojson', methods=['POST'])
 def convert_to_json():
     if not os.path.exists(app.config['JSON_FOLDER']):
         os.mkdir(app.config['JSON_FOLDER'])
 
-    # Kiểm tra xem có tệp nào được tải lên không
     if 'file' not in request.files:
         return jsonify({"error": "No file part"})
 
     uploaded_file = request.files['file']
 
-    # Kiểm tra xem tệp đã được chọn hay không
     if uploaded_file.filename == '':
         return jsonify({"error": "No selected file"})
+
+    image = False
 
     if uploaded_file:
         # Lưu tệp được tải lên vào thư mục tạm thời
@@ -207,45 +274,60 @@ def convert_to_json():
         temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         uploaded_file.save(temp_file_path)
 
-        # Tiến hành chuyển đổi tệp thành JSON
         if filename.lower().endswith(".docx"):
             docx_text = convert_docx_to_txt(temp_file_path)
 
-            # Tạo một tệp văn bản tạm thời và lưu nội dung DOCX vào đó
             temp_txt_file_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(filename)[0] + ".txt")
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(docx_text)
 
-            # Tiếp tục với việc chuyển đổi tệp văn bản thành JSON
-            json_data = convert_txt_to_json(temp_txt_file_path,filename)
+            with open(temp_txt_file_path, 'r', encoding='utf-8') as txt_file:
+                content = txt_file.read()
+                json_data = convert_txt_to_json(temp_txt_file_path,filename, image)
 
         elif filename.lower().endswith(".pdf"):
-            # Trích xuất văn bản từ tệp PDF
             pdf_text = convert_pdf_to_text(temp_file_path)
 
-            # Tạo một tệp văn bản tạm thời và lưu nội dung PDF vào đó
             temp_txt_file_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(filename)[0] + ".txt")
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(pdf_text)
 
-            # Tiếp tục với việc chuyển đổi tệp văn bản thành JSON
-            json_data = convert_txt_to_json(temp_txt_file_path, filename)
+            json_data = convert_txt_to_json(temp_txt_file_path, filename, image)
+        
         elif filename.lower().endswith(".txt"):
-            json_data = convert_txt_to_json(temp_file_path, filename)
+            with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
+                content = txt_file.read()
+                content_hash = calculate_content_hash(content)
+
+            if is_document_exists("my_index", content_hash):
+                return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
+            else:
+                json_data = convert_txt_to_json(temp_file_path, filename, image)
+
+        elif filename.lower().endswith((".jpg", ".png")):
+            # Sử dụng OCR để trích xuất nội dung từ hình ảnh
+            image = True
+            image = Image.open(temp_file_path)
+            ocr_text = pytesseract.image_to_string(image, lang='eng')   
+            
+            # Tạo tệp văn bản (txt) từ văn bản đã trích xuất
+            txt_filename = os.path.splitext(filename)[0] + ".txt"
+            temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], txt_filename)
+            
+            with open(temp_file_path, "w", encoding="utf-8") as txt_file:
+                txt_file.write(ocr_text)
+
+            json_data = convert_txt_to_json(temp_file_path, filename, image)
+
         else:
             return jsonify({"error": "Unsupported file format"})
 
-    
-
-        # Xóa tệp tạm thời sau khi đã chuyển đổi
         json_output_path = os.path.join(app.config['JSON_FOLDER'], os.path.splitext(filename)[0] + ".json")
         with open(json_output_path, 'r', encoding='utf-8') as json_file:
             json_data = json.load(json_file)
 
-            # Gửi dữ liệu JSON lên Elasticsearch
             es.index(index="my_index" ,body=json_data)
         #os.remove(temp_file_path)    
-
 
         # Trích xuất từ khóa từ nội dung và thêm vào index gợi ý
         for filename in os.listdir(data_directory):
@@ -265,6 +347,7 @@ def convert_to_json():
 
 @app.route('/search', methods=['GET', 'POST'])
 def search():
+
     if request.method == 'POST':
         # Lấy dữ liệu JSON từ yêu cầu POST
         data = request.get_json()
@@ -281,7 +364,15 @@ def search():
     # Tạo một truy vấn bool với truy vấn fuzzy cho các từ quan trọng
     should_queries = []
     for word in words:
-        should_queries.append({"match": {"content": word}})
+        fuzzy_query = {
+            "match": {
+                "content": {
+                    "query": word,
+                    "fuzziness": "AUTO"  # Đặt mức độ fuzzy tại "AUTO" hoặc giá trị khác theo mong muốn
+                }
+            }
+        }
+        should_queries.append(fuzzy_query)
 
     bool_query = {"bool": {"should": should_queries}}
 
@@ -305,7 +396,9 @@ def search():
             'title': hit['_source']['title'],
             'filename': hit['_source']['filename'],
             'highlights': hit.get('highlight', {}).get('content', []),
-            'semantic_score': hit['_score']
+            'semantic_score': hit['_score'],
+            'category' : hit['_source']['category'],
+            'content_hash': hit['_source']['content_hash']
         }
         response.append(entry)
 
@@ -318,9 +411,8 @@ def search():
         semantic_results = search_by_semantic(user_input)
         response = semantic_results
 
+
     return jsonify(response)
-
-
 
 @app.route('/deletejson', methods=['POST'])
 def delete_json():
@@ -363,7 +455,6 @@ def delete_json():
     else:
         return jsonify({"error": "Không tìm thấy dữ liệu cần xoá."})
 
-
 @app.route('/suggest', methods=['GET'])
 def get_suggestions():
     user_query = request.args.get('q')
@@ -373,17 +464,96 @@ def get_suggestions():
                 "prefix": user_query,
                 "completion": {
                     "field": "suggestion",
-                    "size": 10
+                    "size": 20
                 }
             }
         }
     }
     results = es.search(index="suggestions", body=search_body)
     suggestions = results["suggest"]["text-suggest"][0]["options"]
-    return jsonify([suggestion["_source"]["suggestion"] for suggestion in suggestions])
+
+    unique_suggestions = set()  
+    unique_results = []
+
+    for suggestion in suggestions:
+        suggestion_text = suggestion["_source"]["suggestion"]
+        if suggestion_text not in unique_suggestions:
+            unique_suggestions.add(suggestion_text)
+            unique_results.append(suggestion_text)
+
+    return jsonify(unique_results)
+
+    # return jsonify([suggestion["_source"]["suggestion"] for suggestion in suggestions])
 
 
+@app.route('/search_image', methods=['POST'])
+def search_image():
+    # Kiểm tra xem có tệp hình ảnh được tải lên hay không
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file uploaded"})
 
+    # Lấy tệp hình ảnh từ yêu cầu
+    uploaded_file = request.files['image']
+
+    filename = secure_filename(uploaded_file.filename)
+    temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    uploaded_file.save(temp_file_path)
+
+    image = Image.open(temp_file_path)
+    # Trích xuất nội dung từ hình ảnh bằng OCR
+    ocr_text = pytesseract.image_to_string(image, lang='eng')
+
+    words = ocr_text.split()
+
+    should_queries = []
+    for word in words:
+        fuzzy_query = {
+            "match": {
+                "content": {
+                    "query": word,
+                    "fuzziness": "AUTO"  # Đặt mức độ fuzzy tại "AUTO" hoặc giá trị khác theo mong muốn
+                }
+            }
+        }
+        should_queries.append(fuzzy_query)
+
+    bool_query = {"bool": {"should": should_queries}}
+
+    # Sử dụng truy vấn bool trong truy vấn chính
+    query = {
+        "query": bool_query,
+        "highlight": {
+            "fields": {
+                "content": {}
+            }
+        }
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    results = es.search(index="my_index", body=query, headers=headers)
+
+    response = []
+    for hit in results['hits']['hits']:
+        entry = {
+            'filename': hit['_source']['filename'],
+            'title': hit['_source']['title'],
+            'highlights': hit.get('highlight', {}).get('content', []),
+            'semantic_score': hit['_score'],
+            'category' : hit['_source']['category'],
+            'content_hash': hit['_source']['content_hash']
+        }
+        response.append(entry)
+
+    # Sắp xếp kết quả theo điểm số semantic giảm dần
+    response = sorted(response, key=lambda x: x['semantic_score'], reverse=True)
+    
+    return jsonify(response)
 
 if __name__ == '__main__':
+
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.mkdir(app.config['UPLOAD_FOLDER'])
     app.run()
+
+
