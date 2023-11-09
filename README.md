@@ -66,3 +66,5 @@ chọn body -> form-data -> key : "filename" (chọn Text) -> value "002.txt"
 http://127.0.0.1:5000/suggest
 
 để bắt đầu search : chọn params với key : q và value : "input của user"
+
+

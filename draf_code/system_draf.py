@@ -11,7 +11,7 @@ import torch
 import pytesseract
 import uuid
 from PIL import Image
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, BertForSequenceClassification
 from elasticsearch import Elasticsearch
 from flask import Flask, request, jsonify, send_file
 from PyPDF2 import PdfFileReader
@@ -29,9 +29,15 @@ app.config['JSON_FOLDER'] = "json_output"
 data_directory = "/Users/nguyen/Desktop/Docker/system/draf_code/json_output"
 es = Elasticsearch([{'host': '127.0.0.1', 'port': 9200, 'scheme': 'http'}])
 
+# Load fine-tuned classification model
+classification_model = BertForSequenceClassification.from_pretrained('/Users/nguyen/Desktop/Docker/BERT/fine_tuned_model/checkpoint-1000', num_labels=5)  
+
+
 # Load pre-trained BERT model and tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertModel.from_pretrained('bert-base-uncased')
+
+
 
 # Tạo thư mục đầu ra cho JSON nếu nó chưa tồn tại
 if not os.path.exists(app.config['JSON_FOLDER']):
@@ -40,7 +46,7 @@ if not os.path.exists(app.config['JSON_FOLDER']):
 id_counter = 1
 bulk_actions = []
 
-def convert_txt_to_json(file_path, filename, image):
+def convert_txt_to_json(file_path, filename, image, category ):
     global id_counter
     with open(file_path, 'r', encoding='utf-8') as file:
         file_content = file.read()
@@ -67,7 +73,7 @@ def convert_txt_to_json(file_path, filename, image):
    
         id = str(id_counter).zfill(3)
         id_counter += 1
-        category = "business"
+        category = category
 
         json_data = {
             "filename": filename,
@@ -250,6 +256,20 @@ def search_images(query):
 
     return image_results
 
+#classification_model
+def classify_text(text):
+    
+    inputs = tokenizer(text, return_tensors="pt")
+    
+    
+    with torch.no_grad():
+        outputs = classification_model(**inputs)
+
+    
+    predicted_label = torch.argmax(outputs.logits, dim=1).item()
+    
+    return predicted_label
+
 
 ######## API #########
 
@@ -269,11 +289,20 @@ def convert_to_json():
     image = False
 
     if uploaded_file:
+
         # Lưu tệp được tải lên vào thư mục tạm thời
         filename = secure_filename(uploaded_file.filename)
         temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         uploaded_file.save(temp_file_path)
 
+        # Thực hiện phân loại văn bản
+        with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
+            content = txt_file.read()
+            category_label = classify_text(content)
+            category_names = ["business", "entertainment", "politic", "sport", "tech"]
+            category = category_names[category_label]
+
+        #thực hiện chuyển đổi văn bản sang định dạng txt sau đó chuyển sang file json
         if filename.lower().endswith(".docx"):
             docx_text = convert_docx_to_txt(temp_file_path)
 
@@ -283,7 +312,7 @@ def convert_to_json():
 
             with open(temp_txt_file_path, 'r', encoding='utf-8') as txt_file:
                 content = txt_file.read()
-                json_data = convert_txt_to_json(temp_txt_file_path,filename, image)
+                json_data = convert_txt_to_json(temp_txt_file_path,filename, image,  category )
 
         elif filename.lower().endswith(".pdf"):
             pdf_text = convert_pdf_to_text(temp_file_path)
@@ -292,7 +321,7 @@ def convert_to_json():
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(pdf_text)
 
-            json_data = convert_txt_to_json(temp_txt_file_path, filename, image)
+            json_data = convert_txt_to_json(temp_txt_file_path, filename, image, category )
         
         elif filename.lower().endswith(".txt"):
             with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
@@ -302,7 +331,7 @@ def convert_to_json():
             if is_document_exists("my_index", content_hash):
                 return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
             else:
-                json_data = convert_txt_to_json(temp_file_path, filename, image)
+                json_data = convert_txt_to_json(temp_file_path, filename, image, category )
 
         elif filename.lower().endswith((".jpg", ".png")):
             # Sử dụng OCR để trích xuất nội dung từ hình ảnh
@@ -317,7 +346,7 @@ def convert_to_json():
             with open(temp_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(ocr_text)
 
-            json_data = convert_txt_to_json(temp_file_path, filename, image)
+            json_data = convert_txt_to_json(temp_file_path, filename, image, category )
 
         else:
             return jsonify({"error": "Unsupported file format"})
@@ -358,6 +387,11 @@ def search():
     if not user_input:
         return jsonify({"error": "Missing 'q' parameter"})
 
+    # Phân loại văn bản để xác định category
+    category_label = classify_text(user_input)
+    category_names = ["business", "entertainment", "politic", "sport", "tech"]
+    category = category_names[category_label]
+
     # Chia truy vấn thành các từ
     words = user_input.split()
 
@@ -368,12 +402,20 @@ def search():
             "match": {
                 "content": {
                     "query": word,
-                    "fuzziness": "AUTO"  # Đặt mức độ fuzzy tại "AUTO" hoặc giá trị khác theo mong muốn
+                    "fuzziness": "AUTO"  
                 }
             }
         }
         should_queries.append(fuzzy_query)
-
+    
+    # Thêm điều kiện tìm kiếm theo category
+    category_query = {
+        "match": {
+            "category": category
+        }
+    }
+    should_queries.append(category_query)
+    
     bool_query = {"bool": {"should": should_queries}}
 
     # Sử dụng truy vấn bool trong truy vấn chính
