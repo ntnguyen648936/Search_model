@@ -1,8 +1,11 @@
 Hướng dẫn chạy chương trình
 
-1. Đầu tiên cần khởi động docker và elasticsearch với lệnh sau: (terminal)
+1. Đầu tiên cần khởi động mở ứng dụng docker và sau đó chạy lệnh sau: (terminal)
 
 docker-compose up -d 
+
+sau đó chạy file system_draf.py
+
 
 2. tạo 1 index my_index để lưu dữ liệu nếu chưa có: (terminal)
 

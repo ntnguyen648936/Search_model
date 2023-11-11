@@ -2,7 +2,7 @@
 # chương trình sẽ nhận input là 1 file txt bất kì từ user
 # sau khi nhận được input chương trình sẽ trích xuất các trường và trả về file 
 
-
+import fitz
 import hashlib
 import json
 import re
@@ -46,7 +46,7 @@ if not os.path.exists(app.config['JSON_FOLDER']):
 id_counter = 1
 bulk_actions = []
 
-def convert_txt_to_json(file_path, filename, image, category ):
+def convert_txt_to_json(file_path, filename, image):
     global id_counter
     with open(file_path, 'r', encoding='utf-8') as file:
         file_content = file.read()
@@ -63,7 +63,11 @@ def convert_txt_to_json(file_path, filename, image, category ):
         if is_document_exists("my_index", content_hash):
             print(f"Document with content hash {content_hash} already exists. Skipping.")
             return
-            
+        
+        category_label = classify_text(content)
+        category_names = ["business", "entertainment", "politic", "sport", "tech"]
+        category = category_names[category_label]
+
 ############# BERT model  ##############################
 # dùng BERT model để tính toán giá trị của semantic từ đó scó thể tìm kiếm dựa trên nội dung
         input_ids = tokenizer.encode(content, add_special_tokens=True)
@@ -295,12 +299,12 @@ def convert_to_json():
         temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         uploaded_file.save(temp_file_path)
 
-        # Thực hiện phân loại văn bản
-        with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
-            content = txt_file.read()
-            category_label = classify_text(content)
-            category_names = ["business", "entertainment", "politic", "sport", "tech"]
-            category = category_names[category_label]
+        # # Thực hiện phân loại văn bản
+        # with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
+        #     content = txt_file.read()
+        #     category_label = classify_text(content)
+        #     category_names = ["business", "entertainment", "politic", "sport", "tech"]
+        #     category = category_names[category_label]
 
         #thực hiện chuyển đổi văn bản sang định dạng txt sau đó chuyển sang file json
         if filename.lower().endswith(".docx"):
@@ -312,7 +316,7 @@ def convert_to_json():
 
             with open(temp_txt_file_path, 'r', encoding='utf-8') as txt_file:
                 content = txt_file.read()
-                json_data = convert_txt_to_json(temp_txt_file_path,filename, image,  category )
+                json_data = convert_txt_to_json(temp_txt_file_path,filename, image)
 
         elif filename.lower().endswith(".pdf"):
             pdf_text = convert_pdf_to_text(temp_file_path)
@@ -321,7 +325,7 @@ def convert_to_json():
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(pdf_text)
 
-            json_data = convert_txt_to_json(temp_txt_file_path, filename, image, category )
+            json_data = convert_txt_to_json(temp_txt_file_path, filename, image)
         
         elif filename.lower().endswith(".txt"):
             with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
@@ -331,7 +335,7 @@ def convert_to_json():
             if is_document_exists("my_index", content_hash):
                 return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
             else:
-                json_data = convert_txt_to_json(temp_file_path, filename, image, category )
+                json_data = convert_txt_to_json(temp_file_path, filename, image)
 
         elif filename.lower().endswith((".jpg", ".png")):
             # Sử dụng OCR để trích xuất nội dung từ hình ảnh
@@ -346,7 +350,7 @@ def convert_to_json():
             with open(temp_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(ocr_text)
 
-            json_data = convert_txt_to_json(temp_file_path, filename, image, category )
+            json_data = convert_txt_to_json(temp_file_path, filename, image)
 
         else:
             return jsonify({"error": "Unsupported file format"})
