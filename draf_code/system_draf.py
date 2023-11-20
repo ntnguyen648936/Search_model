@@ -2,6 +2,7 @@
 # chương trình sẽ nhận input là 1 file txt bất kì từ user
 # sau khi nhận được input chương trình sẽ trích xuất các trường và trả về file 
 
+import sys
 import fitz
 import hashlib
 import json
@@ -37,6 +38,10 @@ classification_model = BertForSequenceClassification.from_pretrained('/Users/ngu
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertModel.from_pretrained('bert-base-uncased')
 
+# tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', max_len=1024)
+# model = BertModel.from_pretrained('bert-base-uncased', max_position_embeddings=1024, ignore_mismatched_sizes=True)
+
+
 
 
 # Tạo thư mục đầu ra cho JSON nếu nó chưa tồn tại
@@ -46,7 +51,7 @@ if not os.path.exists(app.config['JSON_FOLDER']):
 id_counter = 1
 bulk_actions = []
 
-def convert_txt_to_json(file_path, filename, image):
+def convert_txt_to_json(file_path, filename, image, content_hash ):
     global id_counter
     with open(file_path, 'r', encoding='utf-8') as file:
         file_content = file.read()
@@ -58,11 +63,11 @@ def convert_txt_to_json(file_path, filename, image):
             title = "image"
             content = file_content
 
-        content_hash = calculate_content_hash(content)
-
-        if is_document_exists("my_index", content_hash):
-            print(f"Document with content hash {content_hash} already exists. Skipping.")
-            return
+        # content_hash = calculate_content_hash(content)
+        content_hash = content_hash
+        # if is_document_exists("my_index", content_hash):
+        #     print(f"Document with content hash {content_hash} already exists. Skipping.")
+        #     sys.exit()
         
         category_label = classify_text(content)
         category_names = ["business", "entertainment", "politic", "sport", "tech"]
@@ -70,7 +75,9 @@ def convert_txt_to_json(file_path, filename, image):
 
 ############# BERT model  ##############################
 # dùng BERT model để tính toán giá trị của semantic từ đó scó thể tìm kiếm dựa trên nội dung
-        input_ids = tokenizer.encode(content, add_special_tokens=True)
+        input_ids = tokenizer.encode(content, add_special_tokens=True, max_length=1024)
+
+        # input_ids = tokenizer.encode(content, add_special_tokens=True)
         with torch.no_grad():
             outputs = model(torch.tensor(input_ids).unsqueeze(0))
             semantic_representation = outputs.last_hidden_state.mean(dim=1).tolist()[0]
@@ -85,6 +92,7 @@ def convert_txt_to_json(file_path, filename, image):
             "content": content,
             "semantic": semantic_representation,
             "category": category,
+            "page" : "1",
             "content_hash": content_hash
         }
         
@@ -133,7 +141,9 @@ def search_by_semantic(user_input):
 
     semantic_results = []
 
-    input_ids = tokenizer.encode(user_input, add_special_tokens=True)
+    # input_ids = tokenizer.encode(user_input, add_special_tokens=True)
+    input_ids = tokenizer.encode(user_input, add_special_tokens=True, max_length=1024)
+
     with torch.no_grad():
         user_input_embedding = model(torch.tensor(input_ids).unsqueeze(0))
         user_input_embedding = user_input_embedding.last_hidden_state.mean(dim=1).tolist()[0]
@@ -300,11 +310,11 @@ def convert_to_json():
         uploaded_file.save(temp_file_path)
 
         # # Thực hiện phân loại văn bản
-        # with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
-        #     content = txt_file.read()
-        #     category_label = classify_text(content)
-        #     category_names = ["business", "entertainment", "politic", "sport", "tech"]
-        #     category = category_names[category_label]
+        with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
+            content = txt_file.read()
+            category_label = classify_text(content)
+            category_names = ["business", "entertainment", "politic", "sport", "tech"]
+            category = category_names[category_label]
 
         #thực hiện chuyển đổi văn bản sang định dạng txt sau đó chuyển sang file json
         if filename.lower().endswith(".docx"):
@@ -335,7 +345,7 @@ def convert_to_json():
             if is_document_exists("my_index", content_hash):
                 return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
             else:
-                json_data = convert_txt_to_json(temp_file_path, filename, image)
+                json_data = convert_txt_to_json(temp_file_path, filename, image, content_hash )
 
         elif filename.lower().endswith((".jpg", ".png")):
             # Sử dụng OCR để trích xuất nội dung từ hình ảnh
@@ -444,6 +454,7 @@ def search():
             'highlights': hit.get('highlight', {}).get('content', []),
             'semantic_score': hit['_score'],
             'category' : hit['_source']['category'],
+            'page' : "1",
             'content_hash': hit['_source']['content_hash']
         }
         response.append(entry)
