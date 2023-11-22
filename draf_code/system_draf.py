@@ -17,9 +17,10 @@ from elasticsearch import Elasticsearch
 from flask import Flask, request, jsonify, send_file
 from PyPDF2 import PdfFileReader
 from docx import Document
+from collections import Counter
 from werkzeug.utils import secure_filename
 from nltk.tokenize import sent_tokenize
-
+from extract_text import stack_text_sections, extract_related_sentences, majority_vote
 app = Flask(__name__)
 
 # Thư mục chứa tệp đầu vào
@@ -38,18 +39,13 @@ classification_model = BertForSequenceClassification.from_pretrained('/Users/ngu
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 model = BertModel.from_pretrained('bert-base-uncased')
 
-# tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', max_len=1024)
-# model = BertModel.from_pretrained('bert-base-uncased', max_position_embeddings=1024, ignore_mismatched_sizes=True)
-
-
-
-
 # Tạo thư mục đầu ra cho JSON nếu nó chưa tồn tại
 if not os.path.exists(app.config['JSON_FOLDER']):
     os.mkdir(app.config['JSON_FOLDER'])
 
 id_counter = 1
 bulk_actions = []
+# max_tokens_per_section = 500
 
 def convert_txt_to_json(file_path, filename, image, content_hash ):
     global id_counter
@@ -65,23 +61,24 @@ def convert_txt_to_json(file_path, filename, image, content_hash ):
 
         # content_hash = calculate_content_hash(content)
         content_hash = content_hash
-        # if is_document_exists("my_index", content_hash):
-        #     print(f"Document with content hash {content_hash} already exists. Skipping.")
-        #     sys.exit()
+       
+        # categories = classify_text_large_input(content, max_tokens_per_section=500)
+        text_sections = stack_text_sections(content, max_tokens_per_section=500)
+        semantic_representations = []
+        categories = []
+        for section in text_sections:
+
+            input_ids = tokenizer.encode(content, add_special_tokens=True, max_length=512, truncation=True, padding='max_length')
+            with torch.no_grad():
+                outputs = model(torch.tensor(input_ids).unsqueeze(0))
+                semantic_representation = outputs.last_hidden_state.mean(dim=1).tolist()[0]
+            semantic_representations.append(semantic_representation)
+
+            category_labels = classify_text_large_input(section)
+            categories.append(category_labels)
         
-        category_label = classify_text(content)
-        category_names = ["business", "entertainment", "politic", "sport", "tech"]
-        category = category_names[category_label]
+        category = majority_vote(categories)
 
-############# BERT model  ##############################
-# dùng BERT model để tính toán giá trị của semantic từ đó scó thể tìm kiếm dựa trên nội dung
-        input_ids = tokenizer.encode(content, add_special_tokens=True, max_length=1024)
-
-        # input_ids = tokenizer.encode(content, add_special_tokens=True)
-        with torch.no_grad():
-            outputs = model(torch.tensor(input_ids).unsqueeze(0))
-            semantic_representation = outputs.last_hidden_state.mean(dim=1).tolist()[0]
-   
         id = str(id_counter).zfill(3)
         id_counter += 1
         category = category
@@ -90,7 +87,7 @@ def convert_txt_to_json(file_path, filename, image, content_hash ):
             "filename": filename,
             "title": title,
             "content": content,
-            "semantic": semantic_representation,
+            "semantic": semantic_representations,
             "category": category,
             "page" : "1",
             "content_hash": content_hash
@@ -142,7 +139,7 @@ def search_by_semantic(user_input):
     semantic_results = []
 
     # input_ids = tokenizer.encode(user_input, add_special_tokens=True)
-    input_ids = tokenizer.encode(user_input, add_special_tokens=True, max_length=1024)
+    input_ids = tokenizer.encode(user_input, add_special_tokens=True, max_length=500)
 
     with torch.no_grad():
         user_input_embedding = model(torch.tensor(input_ids).unsqueeze(0))
@@ -237,7 +234,6 @@ def add_document_to_elasticsearch(index, filename, content):
             "content_hash": content_hash
         })
 
-
 def search_images(query):
     # Thực hiện truy vấn Elasticsearch để tìm kiếm hình ảnh dựa trên nội dung
     search_body = {
@@ -275,15 +271,32 @@ def classify_text(text):
     
     inputs = tokenizer(text, return_tensors="pt")
     
-    
     with torch.no_grad():
         outputs = classification_model(**inputs)
-
-    
+ 
     predicted_label = torch.argmax(outputs.logits, dim=1).item()
     
     return predicted_label
 
+def classify_text_large_input(content, max_tokens_per_section=500):
+    # Chia nhỏ văn bản thành các phần với kích thước tối đa là max_tokens_per_section
+    text_sections = stack_text_sections(content, max_tokens_per_section=500)
+
+    # Tạo danh sách category labels cho từng phần văn bản
+    category_labels = []
+    for section in text_sections:
+        # Giảm chiều dài của mỗi phần văn bản nếu nó vượt quá giới hạn của mô hình BERT
+        section = section[:512]  # Giả sử mô hình BERT yêu cầu kích thước tối đa là 512
+        category_label = classify_text(section)
+        category_labels.append(category_label)
+
+    # Danh sách các tên category tương ứng
+    category_names = ["business", "entertainment", "politic", "sport", "tech"]
+
+    # Lấy category tương ứng với phần văn bản được phân loại
+    categories = [category_names[label] for label in category_labels]
+
+    return categories
 
 ######## API #########
 
@@ -309,13 +322,6 @@ def convert_to_json():
         temp_file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         uploaded_file.save(temp_file_path)
 
-        # # Thực hiện phân loại văn bản
-        with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
-            content = txt_file.read()
-            category_label = classify_text(content)
-            category_names = ["business", "entertainment", "politic", "sport", "tech"]
-            category = category_names[category_label]
-
         #thực hiện chuyển đổi văn bản sang định dạng txt sau đó chuyển sang file json
         if filename.lower().endswith(".docx"):
             docx_text = convert_docx_to_txt(temp_file_path)
@@ -323,10 +329,11 @@ def convert_to_json():
             temp_txt_file_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(filename)[0] + ".txt")
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(docx_text)
-
-            with open(temp_txt_file_path, 'r', encoding='utf-8') as txt_file:
-                content = txt_file.read()
-                json_data = convert_txt_to_json(temp_txt_file_path,filename, image)
+            content_hash = calculate_content_hash(docx_text)
+            if is_document_exists("my_index", content_hash):
+                return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
+            else:   
+                json_data = convert_txt_to_json(temp_txt_file_path,filename, image, content_hash)
 
         elif filename.lower().endswith(".pdf"):
             pdf_text = convert_pdf_to_text(temp_file_path)
@@ -334,8 +341,11 @@ def convert_to_json():
             temp_txt_file_path = os.path.join(app.config['UPLOAD_FOLDER'], os.path.splitext(filename)[0] + ".txt")
             with open(temp_txt_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(pdf_text)
-
-            json_data = convert_txt_to_json(temp_txt_file_path, filename, image)
+                content_hash = calculate_content_hash(pdf_text)
+            if is_document_exists("my_index", content_hash):
+                return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
+            else:    
+                json_data = convert_txt_to_json(temp_txt_file_path, filename, image, content_hash)
         
         elif filename.lower().endswith(".txt"):
             with open(temp_file_path, 'r', encoding='utf-8') as txt_file:
@@ -359,8 +369,11 @@ def convert_to_json():
             
             with open(temp_file_path, "w", encoding="utf-8") as txt_file:
                 txt_file.write(ocr_text)
-
-            json_data = convert_txt_to_json(temp_file_path, filename, image)
+                content_hash = calculate_content_hash(ocr_text)
+            if is_document_exists("my_index", content_hash):
+                return jsonify({"error": "Tài liệu đã tồn tại trong hệ thống."})
+            else:
+                json_data = convert_txt_to_json(temp_file_path, filename, image, content_hash)
 
         else:
             return jsonify({"error": "Unsupported file format"})
@@ -385,8 +398,6 @@ def convert_to_json():
                         print(f"Added suggestion: {keyword}")
 
         return jsonify({"message": "Conversion to JSON and upload to Elasticsearch completed."})
-
-
 
 @app.route('/search', methods=['GET', 'POST'])
 def search():
@@ -468,7 +479,6 @@ def search():
         semantic_results = search_by_semantic(user_input)
         response = semantic_results
 
-
     return jsonify(response)
 
 @app.route('/deletejson', methods=['POST'])
@@ -542,7 +552,6 @@ def get_suggestions():
 
     # return jsonify([suggestion["_source"]["suggestion"] for suggestion in suggestions])
 
-
 @app.route('/search_image', methods=['POST'])
 def search_image():
     # Kiểm tra xem có tệp hình ảnh được tải lên hay không
@@ -614,3 +623,4 @@ if __name__ == '__main__':
     app.run()
 
 
+s
