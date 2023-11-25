@@ -11,6 +11,7 @@ import os
 import torch
 import pytesseract
 import uuid
+import numpy as np
 from PIL import Image
 from transformers import BertTokenizer, BertModel, BertForSequenceClassification
 from elasticsearch import Elasticsearch
@@ -187,13 +188,19 @@ def extract_related_sentences(content, user_input, num_sentences=3):
     return related_sentences
 
 def cosine_similarity(embedding1, embedding2):
-    # Tính toán độ tương đồng cosine giữa hai biểu diễn semantic
-    dot_product = sum(a * b for a, b in zip(embedding1, embedding2))
-    magnitude1 = sum(a ** 2 for a in embedding1) ** 0.5
-    magnitude2 = sum(b ** 2 for b in embedding2) ** 0.5
-    if magnitude1 == 0 or magnitude2 == 0:
-        return 0  # Tránh chia cho 0
-    return dot_product / (magnitude1 * magnitude2)
+    embedding2 = np.array(embedding2)
+
+    # Chuyển đổi semantic_representation thành mảng 1 chiều nếu cần thiết
+    if embedding2.ndim == 2 and embedding2.shape[0] == 1:
+        embedding2 = embedding2.squeeze()
+
+    dot_product = np.dot(embedding1, embedding2)
+    norm_embedding1 = np.linalg.norm(embedding1)
+    norm_embedding2 = np.linalg.norm(embedding2)
+    
+    similarity = dot_product / (norm_embedding1 * norm_embedding2)
+    
+    return similarity
 
 # suggestion search
 def add_suggestion_to_index(suggestion):
@@ -623,4 +630,3 @@ if __name__ == '__main__':
     app.run()
 
 
-s
